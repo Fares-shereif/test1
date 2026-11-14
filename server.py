@@ -1,19 +1,29 @@
 """YouTube audio API. Run with: python server.py."""
 import logging
+import os
 import re
 import shutil
+import subprocess
 import time
+import uuid
 from functools import lru_cache
+from importlib.metadata import PackageNotFoundError, version
 import urllib.error
 import urllib.request
 
 import yt_dlp
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-app = FastAPI()
+app = FastAPI(version="1.2.0")
 logger = logging.getLogger(__name__)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+logger.propagate = False
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["GET", "HEAD"],
     allow_headers=["*"], expose_headers=["Content-Length", "Content-Range", "Accept-Ranges"],
@@ -21,14 +31,75 @@ app.add_middleware(
 VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
 
+@lru_cache(maxsize=1)
+def runtime_status():
+    """Public, non-sensitive runtime versions; never expose paths or environment values."""
+    runtimes = {}
+    for name, minimum in (("node", (22, 0, 0)), ("deno", (2, 3, 0))):
+        executable = shutil.which(name)
+        installed_version = None
+        supported = False
+        if executable:
+            try:
+                result = subprocess.run(
+                    [executable, "--version"], capture_output=True, text=True,
+                    timeout=3, check=True,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                match = re.search(r"(\d+)\.(\d+)\.(\d+)", result.stdout)
+                if match:
+                    installed_version = match.group(0)
+                    supported = tuple(map(int, match.groups())) >= minimum
+            except (OSError, subprocess.SubprocessError):
+                pass
+        runtimes[name] = {"version": installed_version, "supported": supported}
+    try:
+        ejs = version("yt-dlp-ejs")
+    except PackageNotFoundError:
+        ejs = None
+    return {"yt_dlp": version("yt-dlp"), "ejs": ejs, "javascript": runtimes}
+
+
+def extraction_error(exc):
+    """Classify observed failures without returning raw exceptions, tokens or URLs."""
+    message = str(exc).lower()
+    if "confirm you're not a bot" in message or "confirm you’re not a bot" in message:
+        return "YOUTUBE_VERIFICATION_REQUIRED", "The audio provider requires verification from this server."
+    if any(text in message for text in ("javascript runtime", "js runtime", "challenge solver", "ejs component")):
+        return "JS_RUNTIME_ERROR", "Check the supported JavaScript runtime and yt-dlp-ejs installation on the server."
+    if "requested format is not available" in message or "no playable audio format" in message:
+        return "AUDIO_FORMAT_UNAVAILABLE", "No compatible audio format was returned. Check runtime versions and provider restrictions."
+    if any(text in message for text in ("private video", "video unavailable", "not available in your country", "age-restricted", "confirm your age", "login required")):
+        return "VIDEO_RESTRICTED", "The audio provider reports that this video is restricted or unavailable."
+    if "timed out" in message or "timeout" in message:
+        return "UPSTREAM_TIMEOUT", "The server timed out while connecting to the audio provider."
+    if "429" in message or "too many requests" in message:
+        return "UPSTREAM_RATE_LIMITED", "The audio provider is rate-limiting this server."
+    return "EXTRACTION_FAILED", "Audio extraction failed. Match the error_id with the server logs for the underlying exception."
+
+
+@app.exception_handler(HTTPException)
+async def api_exception_handler(request, exc):
+    if isinstance(exc.detail, dict) and "error_code" in exc.detail:
+        # Keep detail a string for existing clients; add structured diagnostics alongside it.
+        return JSONResponse(status_code=exc.status_code, content=exc.detail, headers=exc.headers)
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers=exc.headers)
+
+
 def validate_id(video_id):
     if not VIDEO_ID.fullmatch(video_id):
         raise HTTPException(400, "Invalid YouTube video ID")
 
 
-@app.get("/health")
+@app.api_route("/", methods=["GET", "HEAD"])
+@app.api_route("/health", methods=["GET", "HEAD"])
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "api_version": app.version, "runtime": runtime_status()}
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    return Response(status_code=204)
 
 
 @app.get("/search")
@@ -59,7 +130,10 @@ def extract_audio(video_id, saver, time_bucket):
     options = {
         "format": f"{quality}[ext=m4a][protocol=https]/{quality}[protocol=https]",
         "noplaylist": True, "quiet": True, "socket_timeout": 20,
-        "js_runtimes": {"node": {}} if shutil.which("node") else {},
+        "js_runtimes": {
+            name: {} for name, runtime in runtime_status()["javascript"].items()
+            if runtime["supported"]
+        },
     }
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
@@ -68,8 +142,13 @@ def extract_audio(video_id, saver, time_bucket):
             raise ValueError("No playable audio format")
         return info
     except Exception as exc:
-        logger.exception("Audio extraction failed for %s", video_id)
-        raise HTTPException(502, "Cannot extract this audio. Update yt-dlp; the video may be restricted or unavailable.") from exc
+        error_id = uuid.uuid4().hex[:12]
+        error_code, detail = extraction_error(exc)
+        logger.exception("Audio extraction failed id=%s video=%s code=%s", error_id, video_id, error_code)
+        raise HTTPException(502, {
+            "detail": detail, "error_code": error_code,
+            "error_id": error_id, "runtime": runtime_status(),
+        }) from exc
 
 
 def audio_info(video_id, saver):
@@ -132,4 +211,4 @@ def proxy_audio(video_id: str, request: Request, saver: bool = True):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8000")))
